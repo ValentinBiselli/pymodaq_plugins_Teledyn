@@ -1,8 +1,13 @@
 from setuptools import setup, find_packages
 from pathlib import Path
-import toml
 
-config = toml.load('./plugin_info.toml')
+try:
+    import tomllib as toml
+except ModuleNotFoundError:
+    import tomli as toml
+
+with open(Path(__file__).parent / 'plugin_info.toml', 'rb') as fconfig:
+    config = toml.load(fconfig)
 SHORT_PLUGIN_NAME = config['plugin-info']['SHORT_PLUGIN_NAME']
 PLUGIN_NAME = f"pymodaq_plugins_{SHORT_PLUGIN_NAME}"
 
@@ -44,6 +49,6 @@ setup(
     package_dir={'': 'src'},
     include_package_data=True,
     entry_points={'pymodaq.plugins': f'{SHORT_PLUGIN_NAME} = {PLUGIN_NAME}'},
-    install_requires=['toml', ]+config['plugin-install']['packages-required'],
+    install_requires=config['plugin-install']['packages-required'],
     **setupOpts
 )

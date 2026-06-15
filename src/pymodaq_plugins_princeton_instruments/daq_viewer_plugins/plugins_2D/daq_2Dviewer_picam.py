@@ -1,120 +1,110 @@
 import numpy as np
-from easydict import EasyDict as edict
-from pymodaq.daq_utils.daq_utils import ThreadCommand, getLineInfo, DataFromPlugins, Axis
-from pymodaq.daq_viewer.utility_classes import DAQ_Viewer_base, comon_parameters, main
+from pymodaq_utils.utils import ThreadCommand
+from pymodaq_utils.logger import set_logger, get_module_name
+from pymodaq_gui.parameter import Parameter
+try:
+    from pymodaq_gui.plotting.items.roi import RoiInfo  # pymodaq > 5.1.x
+except ImportError:
+    from pymodaq_gui.plotting.utils.plot_utils import RoiInfo
+
+from pymodaq.utils.data import DataFromPlugins, Axis
+from pymodaq.control_modules.viewer_utility_classes import DAQ_Viewer_base, comon_parameters, main
 
 from qtpy import QtWidgets, QtCore
 
 from ...hardware.picam_utils import define_pymodaq_pyqt_parameter, sort_by_priority_list, remove_settings_from_list
 
+import pylablib as pll
+pll.par['devices/dlls/picam'] = r'C:\Program Files\Common Files\Princeton Instruments\Picam\Runtime'
 import pylablib.devices.PrincetonInstruments as PI
+
 
 class DAQ_2DViewer_picam(DAQ_Viewer_base):
     """
-        Base class for Princeton Instruments CCD camera controlled with the picam c library.
-
-        =============== ==================
-        **Attributes**   **Type**
-        Nothing to see here...
-        =============== ==================
-
-        See Also
-        --------
-        utility_classes.DAQ_Viewer_base
+    Base class for Princeton Instruments CCD camera controlled with the picam c library.
     """
-    _dvcs = PI.list_cameras()
-    serialnumbers = [dvc.serial_number for dvc in _dvcs]
 
     params = comon_parameters + [
         {'title': 'Controller ID:', 'name': 'controller_id', 'type': 'str', 'value': '', 'readonly': True},
-        {'title': 'Serial number:', 'name': 'serial_number', 'type': 'list', 'limits': serialnumbers},
+        {'title': 'Serial number:', 'name': 'serial_number', 'type': 'list', 'limits': []},
         {'title': 'Simple Settings', 'name': 'simple_settings', 'type': 'bool', 'value': True}
     ]
 
     callback_signal = QtCore.Signal()
-
     hardware_averaging = False
+
+    def ini_attributes(self):
+        """Initialize instance attributes for the detector"""
+        self.controller = None
+        self.x_axis = None
+        self.y_axis = None
+        self.data_shape = 'Data2D'
+        self.callback_thread = None
+        self.roi_select_info = None
 
     def __init__(self, parent=None, params_state=None):
         super().__init__(parent, params_state)
 
-        # Axes are not dealt with at the moment.
-        self.x_axis = None
-        self.y_axis = None
-
-        self.data_shape = 'Data2D'
-        self.callback_thread = None
+    def roi_select(self, roi_info: RoiInfo, ind_viewer: int = 0):
+        """Automatically called when a user uses the RoiSelect ROI from a 2D viewer"""
+        self.roi_select_info = roi_info
+        self.roi_select_viewer_index = ind_viewer
 
     def _update_all_settings(self):
-        """Update all parameters in the interface from the values set in the device.
-        Log any detected changes while updating values in the UI."""
         for grandparam in ['settable_camera_parameters', 'read_only_camera_parameters']:
             for param in self.settings.child(grandparam).children():
-                # update limits in the parameter
                 self.controller.get_attribute(param.title()).update_limits()
-                # retrieve a value change in other parameters
                 newval = self.controller.get_attribute_value(param.title())
                 if newval != param.value():
                     self.settings.child(grandparam, param.name()).setValue(newval)
                     self.emit_status(ThreadCommand('Update_Status', [f'updated {param.title()}: {param.value()}']))
 
-    def _update_rois(self, ):
-        """Special method to commit new ROI settings."""
-        new_x = self.settings.child('settable_camera_parameters', 'rois', 'x').value()
-        new_width = self.settings.child('settable_camera_parameters', 'rois', 'width').value()
-        new_xbinning = self.settings.child('settable_camera_parameters', 'rois', 'x_binning').value()
+    def _update_rois(self):
+        new_x = self.settings['settable_camera_parameters', 'rois', 'x']
+        new_width = self.settings['settable_camera_parameters', 'rois', 'width']
+        new_xbinning = self.settings['settable_camera_parameters', 'rois', 'x_binning']
+        new_y = self.settings['settable_camera_parameters', 'rois', 'y']
+        new_height = self.settings['settable_camera_parameters', 'rois', 'height']
+        new_ybinning = self.settings['settable_camera_parameters', 'rois', 'y_binning']
 
-        new_y = self.settings.child('settable_camera_parameters', 'rois', 'y').value()
-        new_height = self.settings.child('settable_camera_parameters', 'rois', 'height').value()
-        new_ybinning = self.settings.child('settable_camera_parameters', 'rois', 'y_binning').value()
-
-        # In pylablib, ROIs compare as tuples
         new_roi = (new_x, new_width, new_xbinning, new_y, new_height, new_ybinning)
         if new_roi != tuple(self.controller.get_attribute_value('ROIs')[0]):
-            # self.controller.set_attribute_value("ROIs",[new_roi])
-            self.controller.set_roi(new_x, new_x + new_width, new_y, new_y + new_height, hbin=new_xbinning,
-                                    vbin=new_ybinning)
+            self.controller.set_roi(new_x, new_x + new_width, new_y, new_y + new_height,
+                                    hbin=new_xbinning, vbin=new_ybinning)
             self.emit_status(ThreadCommand('Update_Status', [f'Changed ROI: {new_roi}']))
             self._update_all_settings()
             self.controller.clear_acquisition()
-            self.controller._commit_parameters()  # Needed so that the new ROIs are checked by the camera
+            self.controller._commit_parameters()
             self.controller.setup_acquisition()
-            # Finally, prepare view for displaying the new data
             self._prepare_view()
 
-    def commit_settings(self, param):
-        """Commit setting changes to the device."""
-        # We have to treat rois specially
+    def commit_settings(self, param: Parameter):
+        """Apply the consequences of a change of value in the detector settings
+
+        Parameters
+        ----------
+        param: Parameter
+            A given parameter (within detector_settings) whose value has been changed by the user
+        """
         if param.parent().name() == "rois":
             self._update_rois()
-        # Otherwise, the other parameters can be dealt with at once
         elif self.controller.get_attribute(param.title()).writable:
             if self.controller.get_attribute_value(param.title()) != param.value():
-                # Update the controller
-                self.controller.set_attribute_value(param.title(), param.value(), truncate=True, error_on_missing=True)
-                # Log that a parameter change was called
+                self.controller.set_attribute_value(param.title(), param.value(),
+                                                    truncate=True, error_on_missing=True)
                 self.emit_status(ThreadCommand('Update_Status', [f'Changed {param.title()}: {param.value()}']))
                 self._update_all_settings()
 
     def emit_data(self):
-        """
-            Fonction used to emit data obtained by callback.
-            See Also
-            --------
-            daq_utils.ThreadCommand
-        """
         try:
-            # Get  data from buffer
             frame = self.controller.read_newest_image()
-            # Emit the frame.
+            axes = self._camera_axes(frame.shape)
             self.data_grabed_signal.emit([DataFromPlugins(name='Picam',
                                                           data=[np.squeeze(frame)],
                                                           dim=self.data_shape,
                                                           labels=[f'Picam_{self.data_shape}'],
-                                                          )])
-            #To make sure that timed events are executed in continuous grab mode
+                                                          **axes)])
             QtWidgets.QApplication.processEvents()
-
         except Exception as e:
             self.emit_status(ThreadCommand('Update_Status', [str(e), 'log']))
 
@@ -123,53 +113,46 @@ class DAQ_2DViewer_picam(DAQ_Viewer_base):
 
         Parameters
         ----------
-        controller: (object) custom object of a PyMoDAQ plugin (Slave case).
-        None if only one detector by controller (Master case)
+        controller: (object)
+            custom object of a PyMoDAQ plugin (Slave case). None if only one actuator/detector by controller
+            (Master case)
 
         Returns
         -------
-        self.status (edict): with initialization status: three fields:
-            * info (str)
-            * controller (object) initialized controller
-            *initialized: (bool): False if initialization failed otherwise True
+        info: str
+        initialized: bool
+            False if initialization failed otherwise True
         """
-
         try:
-            self.status.update(edict(initialized=False, info="", x_axis=None, y_axis=None, controller=None))
             if self.settings.child('controller_status').value() == "Slave":
                 if controller is None:
                     raise Exception('no controller has been defined externally while this detector is a slave one')
                 else:
-                    self.controller = controller
+                    self.ini_detector_init(old_controller=controller, new_controller=controller)
             else:
-                # Pylablib's PI camera module object
+                dvcs = PI.list_cameras()
+                self.settings.child('serial_number').setLimits([dvc.serial_number for dvc in dvcs])
                 camera = PI.PicamCamera(self.settings.child('serial_number').value())
-                # Set camera name
                 self.settings.child('controller_id').setValue(camera.get_device_info().model)
-                # init controller
-                self.controller = camera
+                self.ini_detector_init(old_controller=None, new_controller=camera)
 
-                #Way to define a wait function with arguments
-                wait_func = lambda: self.controller.wait_for_frame(since='lastread', nframes=1, timeout=20.0)
-                callback = PicamCallback(wait_func)
+            wait_func = lambda: self.controller.wait_for_frame(since='lastread', nframes=1, timeout=20.0)
+            callback = PicamCallback(wait_func)
 
-                self.callback_thread = QtCore.QThread()  # creation of a Qt5 thread
-                callback.moveToThread(self.callback_thread)  # callback object will live within this thread
-                callback.data_sig.connect(self.emit_data)  # when the wait for acquisition returns (with data taken), emit_data will be fired
+            self.callback_thread = QtCore.QThread()
+            callback.moveToThread(self.callback_thread)
+            callback.data_sig.connect(self.emit_data)
+            self.callback_signal.connect(callback.wait_for_acquisition)
+            self.callback_thread.callback = callback
+            self.callback_thread.start()
 
-                self.callback_signal.connect(callback.wait_for_acquisition)
-                self.callback_thread.callback = callback
-                self.callback_thread.start()
-
-
-            # Get all parameters and sort them in read_only or settable groups
             atd = self.controller.get_all_attributes(copy=True)
             camera_params = []
             for k, v in atd.items():
                 tmp = define_pymodaq_pyqt_parameter(v)
                 if tmp is not None:
                     camera_params.append(tmp)
-            #####################################
+
             read_and_set_parameters = [par for par in camera_params if not par['readonly']]
             read_only_parameters = [par for par in camera_params if par['readonly']]
 
@@ -216,7 +199,7 @@ class DAQ_2DViewer_picam(DAQ_Viewer_base):
                       ]
             read_and_set_parameters = sort_by_priority_list(read_and_set_parameters, priority)
             if self.settings.child('simple_settings').value():
-                read_and_set_parameters = remove_settings_from_list(read_and_set_parameters,remove)
+                read_and_set_parameters = remove_settings_from_list(read_and_set_parameters, remove)
 
             # List of priority for ordering the parameters in the UI but for read only params, which is less
             # important (kindof)
@@ -256,57 +239,45 @@ class DAQ_2DViewer_picam(DAQ_Viewer_base):
             if self.settings.child('simple_settings').value():
                 read_only_parameters = remove_settings_from_list(read_only_parameters, remove)
 
-            # Initialisation of the parameters
             self.settings.addChild({'title': 'Settable Camera Parameters',
                                     'name': 'settable_camera_parameters',
                                     'type': 'group',
-                                    'children': read_and_set_parameters,
-                                    })
+                                    'children': read_and_set_parameters})
             self.settings.addChild({'title': 'Read Only Camera Parameters',
                                     'name': 'read_only_camera_parameters',
                                     'type': 'group',
-                                    'children': read_only_parameters,
-                                    })
+                                    'children': read_only_parameters})
 
-            # Prepare the viewer (2D by default)
             self._prepare_view()
 
-            self.status.info = "Initialised camera"
-            self.status.initialized = True
-            self.status.controller = self.controller
-            return self.status
+            info = "Initialised camera"
+            initialized = True
+            return info, initialized
 
         except Exception as e:
-            self.emit_status(ThreadCommand('Update_Status', [getLineInfo() + str(e), 'log']))
-            self.status.info = getLineInfo() + str(e)
-            self.status.initialized = False
-            return self.status
+            self.emit_status(ThreadCommand('Update_Status', [str(e), 'log']))
+            info = str(e)
+            initialized = False
+            return info, initialized
 
     def close(self):
         """
         Terminate the communication protocol
         """
-        # Terminate the communication
         self.controller.close()
-        self.controller = None  # Garbage collect the controller
-        # Clear all the parameters
+        self.controller = None
         self.settings.child('settable_camera_parameters').clearChildren()
         self.settings.child('settable_camera_parameters').remove()
         self.settings.child('read_only_camera_parameters').clearChildren()
         self.settings.child('read_only_camera_parameters').remove()
-        # Reset the status of the Viewer Plugin
         self.status.initialized = False
         self.status.controller = None
         self.status.info = ""
 
     def _toggle_non_online_parameters(self, enabled):
-        """All parameters that cannot be changed while acquisition is on can be automatically
-        enabled or disabled. Note that I have no idea if pymodaq supports this can of things by
-        default but at least that's already implemented..."""
         for param in self.settings.child('settable_camera_parameters').children():
             if not self.controller.get_attribute(param.title()).can_set_online:
                 param.setOpts(enabled=enabled)
-        # The ROIs parameters still need special treatment which is not ideal but well...
         for param in self.settings.child('settable_camera_parameters', "rois").children():
             param.setOpts(enabled=enabled)
 
@@ -330,12 +301,22 @@ class DAQ_2DViewer_picam(DAQ_Viewer_base):
 
         if data_shape != self.data_shape:
             self.data_shape = data_shape
-            # init the viewers
+            axes = self._camera_axes(mock_data.shape)
             self.data_grabed_signal_temp.emit([DataFromPlugins(name='Picam',
                                                                data=[np.squeeze(mock_data)],
                                                                dim=self.data_shape,
-                                                               labels=[f'Picam_{self.data_shape}'])])
+                                                               labels=[f'Picam_{self.data_shape}'],
+                                                               **axes)])
             QtWidgets.QApplication.processEvents()
+
+    def _camera_axes(self, shape):
+        axes = {}
+        if len(shape) >= 2:
+            axes['y_axis'] = Axis('yaxis', units='px', data=np.arange(shape[0]), index=0)
+            axes['x_axis'] = Axis('xaxis', units='px', data=np.arange(shape[1]), index=1)
+        elif len(shape) == 1:
+            axes['x_axis'] = Axis('xaxis', units='px', data=np.arange(shape[0]), index=0)
+        return axes
 
     def grab_data(self, Naverage=1, **kwargs):
         """
@@ -347,14 +328,10 @@ class DAQ_2DViewer_picam(DAQ_Viewer_base):
         try:
             # Warning, acquisition_in_progress returns 1,0 and not a real bool
             if not self.controller.acquisition_in_progress():
-                # 0. Disable all non online-settable parameters
                 self._toggle_non_online_parameters(enabled=False)
-                # 1. Start acquisition
                 self.controller.clear_acquisition()
                 self.controller.start_acquisition()
-            #Then start the acquisition
-            self.callback_signal.emit()  # will trigger the wait for acquisition
-
+            self.callback_signal.emit()
         except Exception as e:
             self.emit_status(ThreadCommand('Update_Status', [str(e), "log"]))
 
@@ -369,18 +346,19 @@ class DAQ_2DViewer_picam(DAQ_Viewer_base):
         self._toggle_non_online_parameters(enabled=True)
         return ''
 
+
 class PicamCallback(QtCore.QObject):
-    """Callback object for the picam library"""
     data_sig = QtCore.Signal()
-    def __init__(self,wait_fn):
+
+    def __init__(self, wait_fn):
         super().__init__()
-        #Set the wait function
         self.wait_fn = wait_fn
 
     def wait_for_acquisition(self):
         new_data = self.wait_fn()
-        if new_data is not False: #will be returned if the main thread called CancelWait
+        if new_data is not False:
             self.data_sig.emit()
+
 
 if __name__ == '__main__':
     main(__file__)
